@@ -1,0 +1,1196 @@
+-- RIVALS client cosmetic unlock/apply patch
+-- Installs local ownership checks, live weapon viewmodel rebuilds, and Equipment menu persistence.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerScripts = LocalPlayer:WaitForChild("PlayerScripts")
+
+local Controllers = PlayerScripts:WaitForChild("Controllers")
+local Modules = PlayerScripts:WaitForChild("Modules")
+
+local PlayerDataController = require(Controllers:WaitForChild("PlayerDataController"))
+local FighterController = require(Controllers:WaitForChild("FighterController"))
+local CosmeticLibrary = require(ReplicatedStorage.Modules:WaitForChild("CosmeticLibrary"))
+local ItemLibrary = require(ReplicatedStorage.Modules:WaitForChild("ItemLibrary"))
+local ReplicatedClass = require(ReplicatedStorage.Modules:WaitForChild("ReplicatedClass"))
+
+local Equipment = require(Modules.UserInterface:WaitForChild("Equipment"))
+local FloatingModelClass = require(Modules.UserInterface.Equipment:WaitForChild("FloatingModel"))
+local EquipmentStateClass = require(Modules.UserInterface.Equipment:WaitForChild("EquipmentState"))
+local StaticViewModel = require(Modules.StaticModel:WaitForChild("StaticViewModel"))
+local ClientViewModel = require(Modules.ClientReplicatedClasses.ClientFighter.ClientItem:WaitForChild("ClientViewModel"))
+local WeaponSlot = require(Modules:WaitForChild("WeaponSlot"))
+
+local state = rawget(_G, "RivalsApplyCosmeticsPatch")
+if type(state) ~= "table" then
+    state = {}
+    rawset(_G, "RivalsApplyCosmeticsPatch", state)
+end
+
+state.version = "scriptt.lua-v3-local-viewmodel"
+state.localEquips = state.localEquips or {}
+state.pendingApplies = state.pendingApplies or {}
+state.lastApply = state.lastApply or {}
+state.originals = state.originals or {}
+state.enabled = true
+
+local refreshWeaponIcons
+local refreshMenu
+
+local COSMETIC_TYPES = {
+    Skin = true,
+    Wrap = true,
+    Charm = true,
+}
+
+local function getThreadIdentity()
+    if type(getthreadidentity) == "function" then
+        return getthreadidentity()
+    end
+    if type(getidentity) == "function" then
+        return getidentity()
+    end
+    return nil
+end
+
+local function setThreadIdentity(identity)
+    if type(setthreadidentity) == "function" then
+        setthreadidentity(identity)
+        return true
+    end
+    if type(set_thread_identity) == "function" then
+        set_thread_identity(identity)
+        return true
+    end
+    if type(setidentity) == "function" then
+        setidentity(identity)
+        return true
+    end
+    return false
+end
+
+local function withThreadIdentity(identity, callback)
+    local previous = getThreadIdentity()
+    local changed = setThreadIdentity(identity)
+    local ok, result = pcall(callback)
+    if changed and previous ~= nil then
+        pcall(setThreadIdentity, previous)
+    end
+    if not ok then
+        error(result, 0)
+    end
+    return result
+end
+
+local function makeBudgetYielder(seconds)
+    local started = os.clock()
+    seconds = seconds or 0.012
+    return function()
+        if os.clock() - started >= seconds then
+            task.wait()
+            started = os.clock()
+        end
+    end
+end
+
+local function cloneCosmetic(cosmetic)
+    if type(cosmetic) ~= "table" or not cosmetic.Name then
+        return nil
+    end
+    if type(cosmetic.Name) == "string" and string.sub(cosmetic.Name, 1, 8) == "MISSING_" then
+        return nil
+    end
+
+    local cloned = { Name = cosmetic.Name }
+    if cosmetic.Inverted ~= nil then
+        cloned.Inverted = cosmetic.Inverted
+    end
+    if cosmetic.IsInverted ~= nil then
+        cloned.IsInverted = cosmetic.IsInverted
+    end
+    return cloned
+end
+
+local function normalizeCosmetic(cosmeticType, name, options)
+    if name == nil or name == false or name == "" or name == "NONE_COSMETIC" then
+        return nil
+    end
+    if type(name) == "string" and string.sub(name, 1, 8) == "MISSING_" then
+        return nil
+    end
+
+    local cosmetic = { Name = tostring(name) }
+    if cosmeticType == "Wrap" and type(options) == "table" then
+        local inverted = options.IsInverted
+        if inverted == nil then
+            inverted = options.Inverted
+        end
+        if inverted ~= nil then
+            cosmetic.Inverted = inverted
+            cosmetic.IsInverted = inverted
+        end
+    end
+    return cosmetic
+end
+
+local function getWeaponName(item)
+    if type(item) ~= "table" then
+        return nil
+    end
+
+    if type(item.Name) == "string" then
+        return item.Name
+    end
+
+    local ok, value = pcall(function()
+        return item:Get("Name")
+    end)
+    if ok and type(value) == "string" then
+        return value
+    end
+
+    return nil
+end
+
+local function isLocalClientItem(item)
+    if type(item) ~= "table" then
+        return false
+    end
+
+    local localFighter = FighterController.LocalFighter
+    local clientFighter = rawget(item, "ClientFighter")
+    if type(clientFighter) == "table" then
+        if clientFighter == localFighter then
+            return true
+        end
+        if clientFighter.IsLocalPlayer ~= nil then
+            return clientFighter.IsLocalPlayer == true
+        end
+        local ok, isLocal = pcall(function()
+            return clientFighter:Get("IsLocalPlayer")
+        end)
+        if ok and isLocal ~= nil then
+            return isLocal == true
+        end
+    end
+
+    if type(localFighter) == "table" then
+        local equipped = rawget(localFighter, "EquippedItem")
+            or (type(localFighter.Get) == "function" and localFighter:Get("EquippedItem"))
+        if item == equipped then
+            return true
+        end
+        if type(localFighter.Items) == "table" then
+            for _, localItem in ipairs(localFighter.Items) do
+                if item == localItem then
+                    return true
+                end
+            end
+        end
+    end
+
+    return false
+end
+
+local function getData()
+    return PlayerDataController.CurrentData and PlayerDataController.CurrentData.Data
+end
+
+local function ensureWeaponData(weapon)
+    local data = getData()
+    if not data then
+        return nil
+    end
+
+    data.WeaponInventory = data.WeaponInventory or {}
+    data.WeaponInventory[weapon] = data.WeaponInventory[weapon] or {
+        Name = weapon,
+        Level = 1,
+        XP = 0,
+    }
+    return data.WeaponInventory[weapon]
+end
+
+local function mergedWeaponData(weapon, baseData)
+    if type(weapon) ~= "string" and type(baseData) == "table" then
+        weapon = baseData.Name
+    end
+    if type(weapon) ~= "string" then
+        return baseData
+    end
+
+    local merged = {}
+    if type(baseData) == "table" then
+        for key, value in pairs(baseData) do
+            merged[key] = value
+        end
+    end
+
+    merged.Name = merged.Name or weapon
+
+    local inventoryData = ensureWeaponData(weapon)
+    if type(inventoryData) == "table" then
+        merged.Level = merged.Level or inventoryData.Level
+        merged.XP = merged.XP or inventoryData.XP
+        merged.Skin = cloneCosmetic(inventoryData.Skin) or merged.Skin
+        merged.Wrap = cloneCosmetic(inventoryData.Wrap) or merged.Wrap
+        merged.Charm = cloneCosmetic(inventoryData.Charm) or merged.Charm
+    end
+
+    local cached = state.localEquips[weapon]
+    if type(cached) == "table" then
+        if cached.Skin ~= nil then
+            merged.Skin = cloneCosmetic(cached.Skin)
+        end
+        if cached.Wrap ~= nil then
+            merged.Wrap = cloneCosmetic(cached.Wrap)
+        end
+        if cached.Charm ~= nil then
+            merged.Charm = cloneCosmetic(cached.Charm)
+        end
+    end
+
+    return merged
+end
+
+local function replicateWeaponInventory()
+    if state._weapon_inventory_replicate_queued then
+        return
+    end
+
+    state._weapon_inventory_replicate_queued = true
+    task.defer(function()
+        state._weapon_inventory_replicate_queued = nil
+        pcall(function()
+            if PlayerDataController.CurrentData and type(PlayerDataController.CurrentData.Replicate) == "function" then
+                PlayerDataController.CurrentData:Replicate("WeaponInventory")
+            end
+        end)
+    end)
+end
+
+function state.commitLocalCosmetic(weapon, cosmeticType, cosmeticName, options)
+    if state.enabled == false then
+        return nil
+    end
+    if type(weapon) ~= "string" or not COSMETIC_TYPES[cosmeticType] then
+        return nil
+    end
+
+    local cosmetic = normalizeCosmetic(cosmeticType, cosmeticName, options)
+    state.localEquips[weapon] = state.localEquips[weapon] or {}
+    state.localEquips[weapon][cosmeticType] = cosmetic
+
+    local weaponData = ensureWeaponData(weapon)
+    if weaponData then
+        weaponData[cosmeticType] = cloneCosmetic(cosmetic)
+    end
+
+    state.pendingApplies[weapon] = true
+    replicateWeaponInventory()
+    if refreshWeaponIcons then
+        refreshWeaponIcons(weapon)
+    end
+    refreshMenu(cosmeticType == "Skin")
+    return cosmetic
+end
+
+state.setLocalCosmetic = state.commitLocalCosmetic
+
+local function desiredForWeapon(weapon)
+    local cached = state.localEquips[weapon]
+    local inventoryData = ensureWeaponData(weapon)
+
+    local skin = type(cached) == "table" and cloneCosmetic(cached.Skin) or nil
+    local wrap = type(cached) == "table" and cloneCosmetic(cached.Wrap) or nil
+    local charm = type(cached) == "table" and cloneCosmetic(cached.Charm) or nil
+
+    if type(inventoryData) == "table" then
+        skin = skin or cloneCosmetic(inventoryData.Skin)
+        wrap = wrap or cloneCosmetic(inventoryData.Wrap)
+        charm = charm or cloneCosmetic(inventoryData.Charm)
+    end
+
+    if not (skin or wrap or charm) then
+        return nil
+    end
+
+    return {
+        Skin = skin,
+        Wrap = wrap,
+        Charm = charm,
+    }
+end
+
+local function selectedWeapon()
+    return Equipment:GetSelectedWeapon()
+        or (Equipment.EquipmentState and Equipment.EquipmentState.SelectedWeapon)
+        or "Assault Rifle"
+end
+
+local function invCosmetic(weapon, cosmeticType)
+    local cached = state.localEquips[weapon] and state.localEquips[weapon][cosmeticType]
+    if type(cached) == "table" and cached.Name and cached.Name ~= "RANDOM_COSMETIC" then
+        return cloneCosmetic(cached)
+    end
+
+    local data = getData()
+    local inv = data and data.WeaponInventory and data.WeaponInventory[weapon]
+    local fromInventory = inv and inv[cosmeticType]
+    if type(fromInventory) == "table" and fromInventory.Name and fromInventory.Name ~= "RANDOM_COSMETIC" then
+        return cloneCosmetic(fromInventory)
+    end
+
+    local ok, weaponData = pcall(function()
+        return PlayerDataController:GetWeaponData(weapon)
+    end)
+    local fromController = ok and type(weaponData) == "table" and weaponData[cosmeticType]
+    if type(fromController) == "table" and fromController.Name and fromController.Name ~= "RANDOM_COSMETIC" then
+        return cloneCosmetic(fromController)
+    end
+
+    return nil
+end
+
+local function selectedCosmeticOverride(equipment, cosmeticType)
+    equipment = equipment or Equipment
+
+    local selected = equipment.GetSelectedCosmetic and equipment:GetSelectedCosmetic()
+    local cosmeticInfo = selected and CosmeticLibrary.Cosmetics[selected]
+    if not (cosmeticInfo and cosmeticInfo.Type == cosmeticType) then
+        return nil
+    end
+
+    local weapon = equipment.GetSelectedWeapon and equipment:GetSelectedWeapon() or selectedWeapon()
+    local override = invCosmetic(weapon, cosmeticType) or {}
+    override.Name = selected
+
+    if cosmeticType == "Wrap" then
+        local inverted = equipment.EquipmentState and equipment.EquipmentState.CosmeticInverted
+        if inverted == nil then
+            inverted = override.Inverted
+        end
+        override.Inverted = inverted
+        override.IsInverted = inverted
+    end
+
+    return override
+end
+
+local function menuViewModelName(floatingModel)
+    local equipment = floatingModel and floatingModel.Equipment or Equipment
+    local weapon = equipment.GetSelectedWeapon and equipment:GetSelectedWeapon() or selectedWeapon()
+    local skin = selectedCosmeticOverride(equipment, "Skin") or invCosmetic(weapon, "Skin")
+    return (skin and skin.Name) or weapon
+end
+
+refreshMenu = function(regen)
+    local floatingModel = Equipment.FloatingModel
+    if not floatingModel then
+        return
+    end
+
+    pcall(function()
+        if regen then
+            floatingModel._last_generate_state = nil
+            floatingModel._last_local_cosmetic_signature = nil
+            floatingModel._v5_signature = nil
+            floatingModel:_Generate()
+        end
+        floatingModel:_UpdateViewModel()
+        floatingModel:Update(0)
+    end)
+end
+
+refreshWeaponIcons = function(weapon)
+    if type(weapon) ~= "string" then
+        return
+    end
+
+    local weaponData = mergedWeaponData(weapon, ensureWeaponData(weapon))
+    local image = ItemLibrary:GetViewModelImageFromWeaponData(weaponData) or ItemLibrary:GetViewModelImage(weapon) or ""
+
+    pcall(function()
+        local left = Equipment.Interface and Equipment.Interface.Left
+        local slot = left and left._weapon_slots and left._weapon_slots[weapon]
+        if slot then
+            if slot.WeaponData ~= nil then
+                slot.WeaponData = weaponData
+            end
+            if slot.Frame and slot.Frame:FindFirstChild("Button") then
+                local icon = slot.Frame.Button:FindFirstChild("Icon", true)
+                local picture = icon and icon:FindFirstChild("Picture", true)
+                if picture and (picture:IsA("ImageLabel") or picture:IsA("ImageButton")) then
+                    picture.Image = image
+                elseif icon and (icon:IsA("ImageLabel") or icon:IsA("ImageButton")) then
+                    icon.Image = image
+                end
+            end
+            if slot.Button then
+                local icon = slot.Button:FindFirstChild("Icon", true)
+                local picture = icon and icon:FindFirstChild("Picture", true)
+                if picture and (picture:IsA("ImageLabel") or picture:IsA("ImageButton")) then
+                    picture.Image = image
+                elseif icon and (icon:IsA("ImageLabel") or icon:IsA("ImageButton")) then
+                    icon.Image = image
+                end
+            end
+        end
+    end)
+
+    pcall(function()
+        local selected = Equipment:GetSelectedWeapon()
+        if selected == weapon then
+            local right = Equipment.Interface and Equipment.Interface.Right
+            local details = right and right.Details
+            if details and details.Icon then
+                details.Icon.Image = image
+            end
+        end
+    end)
+
+    pcall(function()
+        local localFighter = FighterController.LocalFighter
+        local fighterInterface = localFighter and localFighter.FighterInterface
+        local hotbar = fighterInterface and fighterInterface.Hotbar
+        local hotbarSlots = hotbar and hotbar._hotbar_slots
+        if type(hotbarSlots) ~= "table" then
+            return
+        end
+
+        for clientItem, hotbarSlot in pairs(hotbarSlots) do
+            if getWeaponName(clientItem) == weapon and hotbarSlot and hotbarSlot.Icon then
+                hotbarSlot.Icon.Image = image
+            end
+        end
+    end)
+
+end
+
+local function patchOwnership()
+    local function ownsPatch()
+        return true
+    end
+
+    state.originals.cosmeticOwnership = state.originals.cosmeticOwnership or {}
+    for _, name in ipairs({
+        "OwnsCosmeticNormally",
+        "OwnsCosmeticUniversally",
+        "OwnsCosmeticForWeapon",
+        "OwnsCosmetic",
+        "OwnsCosmeticForSomething",
+    }) do
+        if type(CosmeticLibrary[name]) == "function" then
+            state.originals.cosmeticOwnership[name] = state.originals.cosmeticOwnership[name] or CosmeticLibrary[name]
+            CosmeticLibrary[name] = ownsPatch
+        end
+    end
+end
+
+local function patchItemLibraryImages()
+    if not state.originals.getViewModelImage then
+        state.originals.getViewModelImage = ItemLibrary.GetViewModelImage
+        state.originals.getViewModelImageFromWeaponData = ItemLibrary.GetViewModelImageFromWeaponData
+    end
+
+    ItemLibrary.GetViewModelImage = function(self, weapon, skin, highResolution, ...)
+        return state.originals.getViewModelImage(self, weapon, skin, highResolution, ...)
+    end
+
+    ItemLibrary.GetViewModelImageFromWeaponData = function(self, weaponData, highResolution, ...)
+        if not weaponData then
+            return nil
+        end
+
+        return state.originals.getViewModelImageFromWeaponData(self, weaponData, highResolution, ...)
+    end
+end
+
+local function patchPlayerDataController()
+    if state.playerDataPatchVersion == "local-first-v2" then
+        return
+    end
+
+    state.originals.getWeaponData = state.originals.getWeaponData or PlayerDataController.GetWeaponData
+    PlayerDataController.GetWeaponData = function(self, weapon, ...)
+        if type(weapon) ~= "string" then
+            local data = state.originals.getWeaponData(self, weapon, ...)
+            return data
+        end
+
+        local data = ensureWeaponData(weapon) or { Name = weapon, Level = 1, XP = 0 }
+        local cached = state.localEquips[weapon]
+        if type(cached) == "table" then
+            if cached.Skin ~= nil then
+                data.Skin = cloneCosmetic(cached.Skin)
+            end
+            if cached.Wrap ~= nil then
+                data.Wrap = cloneCosmetic(cached.Wrap)
+            end
+            if cached.Charm ~= nil then
+                data.Charm = cloneCosmetic(cached.Charm)
+            end
+        end
+
+        return data
+    end
+    state.playerDataPatchVersion = "local-first-v2"
+end
+
+local function patchWeaponSlot()
+    if state.weaponSlotPatchVersion == "weapon-data-v1" then
+        return
+    end
+
+    state.originals.weaponSlotSetup = state.originals.weaponSlotSetup or WeaponSlot._Setup
+    WeaponSlot._Setup = function(self, ...)
+        if type(self.Name) == "string" then
+            self.WeaponData = mergedWeaponData(self.Name, self.WeaponData or PlayerDataController:GetWeaponData(self.Name))
+        end
+        return state.originals.weaponSlotSetup(self, ...)
+    end
+    state.weaponSlotPatchVersion = "weapon-data-v1"
+end
+
+local function getSerialCodec(item)
+    if type(item) == "table" and type(item.ViewModel) == "table" and type(item.ViewModel.ToEnum) == "function" then
+        return item.ViewModel
+    end
+
+    if type(state._serial_codec) ~= "table" or type(state._serial_codec.ToEnum) ~= "function" then
+        state._serial_codec = ReplicatedClass.new(nil)
+    end
+
+    return state._serial_codec
+end
+
+local function applyDesiredToViewModelSerial(serial, item, weapon, desired)
+    if not (weapon and desired) then
+        return serial
+    end
+
+    serial = type(serial) == "table" and serial or { Data = {} }
+    serial.Data = type(serial.Data) == "table" and serial.Data or {}
+
+    local codec = getSerialCodec(item)
+    serial.Data[codec:ToEnum("Name")] = desired.Skin and desired.Skin.Name or weapon
+    if desired.Wrap then
+        serial.Data[codec:ToEnum("Wrap")] = cloneCosmetic(desired.Wrap)
+    end
+    if desired.Charm then
+        serial.Data[codec:ToEnum("Charm")] = cloneCosmetic(desired.Charm)
+    end
+
+    return serial
+end
+
+local function patchClientViewModel()
+    if state.clientViewModelPatchVersion == "first-person-codec-v3-local-only" then
+        return
+    end
+
+    state.originals.clientViewModelNew = state.originals.clientViewModelNew or ClientViewModel.new
+    ClientViewModel.new = function(serial, item)
+        local weapon = getWeaponName(item)
+        local desired = weapon and desiredForWeapon(weapon)
+        if desired and isLocalClientItem(item) then
+            serial = applyDesiredToViewModelSerial(serial, item, weapon, desired)
+        end
+        return state.originals.clientViewModelNew(serial, item)
+    end
+    state.clientViewModelPatchVersion = "first-person-codec-v3-local-only"
+end
+
+local function patchStaticViewModel()
+    if state.staticViewModelPatchVersion == "cosmetics-v1" then
+        return
+    end
+
+    state.originals.staticViewModelNew = state.originals.staticViewModelNew or StaticViewModel.new
+    StaticViewModel.new = function(name, ...)
+        local weapon = name
+        local cosmeticInfo = CosmeticLibrary.Cosmetics[name]
+        if cosmeticInfo and cosmeticInfo.ItemName then
+            weapon = cosmeticInfo.ItemName
+        end
+
+        local desired = desiredForWeapon(weapon)
+        if desired and desired.Skin and desired.Skin.Name then
+            name = desired.Skin.Name
+        end
+
+        local model = state.originals.staticViewModelNew(name, ...)
+        if desired then
+            if desired.Wrap then
+                pcall(function()
+                    model:SetWrap(cloneCosmetic(desired.Wrap))
+                end)
+            end
+            if desired.Charm then
+                pcall(function()
+                    model:SetCharm(cloneCosmetic(desired.Charm))
+                end)
+            end
+        end
+        return model
+    end
+    state.staticViewModelPatchVersion = "cosmetics-v1"
+end
+
+local function patchFloatingModelClass()
+    if not state.originals.fmGetOverride then
+        state.originals.fmGetOverride = FloatingModelClass._GetSelectedCosmeticOverride
+        state.originals.fmGetName = FloatingModelClass._GetViewModelName
+        state.originals.fmUpdate = FloatingModelClass._UpdateViewModel
+        state.originals.fmGenerate = FloatingModelClass._Generate
+    end
+
+    FloatingModelClass._GetSelectedCosmeticOverride = function(self, cosmeticType)
+        return selectedCosmeticOverride(self.Equipment, cosmeticType)
+    end
+
+    FloatingModelClass._GetViewModelName = function(self)
+        return menuViewModelName(self)
+    end
+
+    FloatingModelClass._UpdateViewModel = function(self)
+        local staticViewModel = self._static_viewmodel
+        if not (staticViewModel and self.Equipment and self.Equipment.IsOpen) then
+            return
+        end
+
+        local weapon = staticViewModel.WeaponName or (self.Equipment:GetSelectedWeapon() or selectedWeapon())
+        local wrap = selectedCosmeticOverride(self.Equipment, "Wrap") or invCosmetic(weapon, "Wrap")
+        local charm = selectedCosmeticOverride(self.Equipment, "Charm") or invCosmetic(weapon, "Charm")
+
+        local hasWeapon = true
+        pcall(function()
+            hasWeapon = PlayerDataController:GetWeaponData(weapon) ~= nil
+        end)
+
+        pcall(function()
+            staticViewModel:SetLocked(not hasWeapon)
+        end)
+        pcall(function()
+            staticViewModel:SetCharm(charm)
+        end)
+        pcall(function()
+            staticViewModel:SetWrap(wrap)
+        end)
+    end
+
+    FloatingModelClass._Generate = function(self)
+        if self.Equipment and self.Equipment.IsOpen then
+            local equipment = self.Equipment
+            local weapon = equipment:GetSelectedWeapon() or selectedWeapon()
+            local skin = selectedCosmeticOverride(equipment, "Skin") or invCosmetic(weapon, "Skin")
+            local wrap = selectedCosmeticOverride(equipment, "Wrap") or invCosmetic(weapon, "Wrap")
+            local charm = selectedCosmeticOverride(equipment, "Charm") or invCosmetic(weapon, "Charm")
+
+            local signature = table.concat({
+                tostring(weapon),
+                tostring(skin and skin.Name),
+                tostring(wrap and wrap.Name),
+                tostring(wrap and (wrap.Inverted or wrap.IsInverted)),
+                tostring(charm and charm.Name),
+                tostring(equipment:GetCustomizingType()),
+            }, "|")
+
+            if self._local_cosmetic_signature ~= signature then
+                self._local_cosmetic_signature = signature
+                self._last_generate_state = nil
+            end
+        end
+
+        return state.originals.fmGenerate(self)
+    end
+end
+
+local function patchFloatingModelInstance()
+    local floatingModel = Equipment.FloatingModel
+    if not floatingModel or state.liveFloatingPatchVersion == "cosmetics-v1" then
+        return
+    end
+
+    state.originals.liveFloatingGenerate = state.originals.liveFloatingGenerate or floatingModel._Generate
+    state.originals.liveFloatingGetName = state.originals.liveFloatingGetName or floatingModel._GetViewModelName
+    state.originals.liveFloatingUpdate = state.originals.liveFloatingUpdate or floatingModel._UpdateViewModel
+    state.originals.liveFloatingOverride = state.originals.liveFloatingOverride or floatingModel._GetSelectedCosmeticOverride
+
+    floatingModel._GetSelectedCosmeticOverride = function(self, cosmeticType)
+        return selectedCosmeticOverride(self.Equipment, cosmeticType)
+    end
+
+    floatingModel._GetViewModelName = function(self)
+        return menuViewModelName(self)
+    end
+
+    floatingModel._UpdateViewModel = function(self)
+        return FloatingModelClass._UpdateViewModel(self)
+    end
+
+    floatingModel._Generate = function(self)
+        return FloatingModelClass._Generate(self)
+    end
+    state.liveFloatingPatchVersion = "cosmetics-v1"
+end
+
+local function patchEquipmentState()
+    local equipmentState = Equipment.EquipmentState
+    if not equipmentState or state.equipmentStatePatchVersion == "cosmetics-v1" then
+        return
+    end
+
+    state.originals.liveSelectCosmetic = state.originals.liveSelectCosmetic or equipmentState.SelectCosmetic
+    state.originals.liveSetInverted = state.originals.liveSetInverted or equipmentState.SetCosmeticInvertedState
+    state.originals.liveStartCustomizing = state.originals.liveStartCustomizing or equipmentState.StartCustomizing
+    state.originals.equipmentSelectCosmetic = state.originals.equipmentSelectCosmetic or Equipment.SelectCosmetic
+    state.originals.equipmentStartCustomizing = state.originals.equipmentStartCustomizing or Equipment.StartCustomizing
+
+    equipmentState.SelectCosmetic = function(self, cosmeticName)
+        local weapon = selectedWeapon()
+        local cosmeticInfo = cosmeticName and CosmeticLibrary.Cosmetics[cosmeticName]
+
+        local result = state.originals.liveSelectCosmetic(self, cosmeticName)
+        if weapon and cosmeticInfo and COSMETIC_TYPES[cosmeticInfo.Type] then
+            state.commitLocalCosmetic(weapon, cosmeticInfo.Type, cosmeticName, {
+                IsInverted = self.CosmeticInverted,
+                Inverted = self.CosmeticInverted,
+            })
+            refreshMenu(cosmeticInfo.Type == "Skin")
+        else
+            refreshMenu(self.CustomizingType == "Skin")
+        end
+        return result
+    end
+
+    equipmentState.SetCosmeticInvertedState = function(self, inverted)
+        local weapon = selectedWeapon()
+        local cosmeticName = self.SelectedCosmetic
+        local cosmeticInfo = cosmeticName and CosmeticLibrary.Cosmetics[cosmeticName]
+
+        local result = state.originals.liveSetInverted(self, inverted)
+        if weapon and cosmeticInfo and cosmeticInfo.Type == "Wrap" then
+            state.commitLocalCosmetic(weapon, "Wrap", cosmeticName, {
+                IsInverted = inverted,
+                Inverted = inverted,
+            })
+            refreshMenu(false)
+        end
+        return result
+    end
+
+    equipmentState.StartCustomizing = function(self, cosmeticType)
+        local previousCosmetic = self.SelectedCosmetic
+        local previousType = self.CustomizingType
+        local weapon = selectedWeapon()
+        local previousInfo = previousCosmetic and CosmeticLibrary.Cosmetics[previousCosmetic]
+
+        if cosmeticType == nil and weapon and previousInfo and COSMETIC_TYPES[previousInfo.Type] then
+            state.commitLocalCosmetic(weapon, previousInfo.Type, previousCosmetic, {
+                IsInverted = self.CosmeticInverted,
+                Inverted = self.CosmeticInverted,
+            })
+        end
+
+        local result = state.originals.liveStartCustomizing(self, cosmeticType)
+        refreshMenu(previousType == "Skin" or cosmeticType == "Skin")
+        return result
+    end
+
+    Equipment.SelectCosmetic = function(self, cosmeticName)
+        return equipmentState:SelectCosmetic(cosmeticName)
+    end
+
+    Equipment.StartCustomizing = function(self, cosmeticType)
+        return equipmentState:StartCustomizing(cosmeticType)
+    end
+    state.equipmentStatePatchVersion = "cosmetics-v1"
+end
+
+function state.applyToItem(item)
+    local weapon = getWeaponName(item)
+    local desired = weapon and desiredForWeapon(weapon)
+    if not desired then
+        return false, "no desired cosmetics"
+    end
+    if not isLocalClientItem(item) then
+        return false, "not local item"
+    end
+    if type(item) ~= "table" then
+        return false, "bad item"
+    end
+
+    local oldViewModel = item.ViewModel
+    if type(oldViewModel) ~= "table" then
+        return false, "no viewmodel"
+    end
+
+    local skinName = desired.Skin and desired.Skin.Name or weapon
+    local data = {}
+    data[oldViewModel:ToEnum("Name")] = skinName
+    if desired.Wrap then
+        data[oldViewModel:ToEnum("Wrap")] = cloneCosmetic(desired.Wrap)
+    end
+    if desired.Charm then
+        data[oldViewModel:ToEnum("Charm")] = cloneCosmetic(desired.Charm)
+    end
+
+    item.Data = item.Data or {}
+    item.Data.Skin = cloneCosmetic(desired.Skin)
+    item.Data.Wrap = cloneCosmetic(desired.Wrap)
+    item.Data.Charm = cloneCosmetic(desired.Charm)
+
+    local ok, newViewModelOrErr = pcall(function()
+        return withThreadIdentity(2, function()
+            return ClientViewModel.new({ Data = data }, item)
+        end)
+    end)
+    if not ok then
+        state.lastApply[weapon] = {
+            ok = false,
+            mode = "new-failed",
+            err = tostring(newViewModelOrErr),
+        }
+        return false, tostring(newViewModelOrErr)
+    end
+
+    local newViewModel = newViewModelOrErr
+    local parent = oldViewModel.Model and oldViewModel.Model.Parent
+        or workspace:WaitForChild("ViewModels"):WaitForChild("FirstPerson")
+    local wasEquipped = oldViewModel._is_equipped or item.IsEquipped
+
+    item.ViewModel = newViewModel
+    pcall(function()
+        oldViewModel:Destroy()
+    end)
+    if wasEquipped then
+        pcall(function()
+            newViewModel:Equip(true)
+        end)
+    end
+    pcall(function()
+        newViewModel:SetParent(parent)
+    end)
+
+    state.lastApply[weapon] = {
+        ok = true,
+        mode = "rebuilt-explicit",
+        skin = skinName,
+        wrap = desired.Wrap and desired.Wrap.Name or nil,
+        charm = desired.Charm and desired.Charm.Name or nil,
+    }
+    return true, "rebuilt-explicit"
+end
+
+function state.applyToWeapon(weapon)
+    local localFighter = FighterController.LocalFighter
+    if not localFighter then
+        return { { ok = false, msg = "no local fighter" } }
+    end
+
+    local results = {}
+    local seen = {}
+
+    local function tryItem(item, label)
+        if type(item) == "table" and not seen[item] and getWeaponName(item) == weapon then
+            seen[item] = true
+            local ok, msg = state.applyToItem(item)
+            table.insert(results, {
+                label = label,
+                ok = ok,
+                msg = msg,
+            })
+        end
+    end
+
+    local equipped = rawget(localFighter, "EquippedItem")
+        or (type(localFighter.Get) == "function" and localFighter:Get("EquippedItem"))
+    tryItem(equipped, "equipped")
+
+    if type(localFighter.Items) == "table" then
+        for index, item in ipairs(localFighter.Items) do
+            tryItem(item, "items[" .. index .. "]")
+        end
+    end
+
+    return results
+end
+
+local function needsCurrentApply(item)
+    local weapon = getWeaponName(item)
+    local desired = weapon and desiredForWeapon(weapon)
+    if not desired then
+        return false
+    end
+
+    local viewModel = item and item.ViewModel
+    if type(viewModel) ~= "table" then
+        return true
+    end
+
+    local targetName = desired.Skin and desired.Skin.Name or weapon
+    local okName, currentName = pcall(function()
+        return viewModel:Get("Name")
+    end)
+    currentName = okName and currentName or viewModel.Name
+    if currentName ~= targetName then
+        return true
+    end
+
+    local currentWrap
+    pcall(function()
+        currentWrap = viewModel:Get("Wrap")
+    end)
+    if desired.Wrap and (type(currentWrap) ~= "table" or currentWrap.Name ~= desired.Wrap.Name) then
+        return true
+    end
+
+    local currentCharm
+    pcall(function()
+        currentCharm = viewModel:Get("Charm")
+    end)
+    if desired.Charm and (type(currentCharm) ~= "table" or currentCharm.Name ~= desired.Charm.Name) then
+        return true
+    end
+
+    return false
+end
+
+local function currentEquippedItem()
+    local localFighter = FighterController.LocalFighter
+    if not localFighter then
+        return nil
+    end
+    return rawget(localFighter, "EquippedItem")
+        or (type(localFighter.Get) == "function" and localFighter:Get("EquippedItem"))
+end
+
+local function installLoops()
+    state.loopToken = (state.loopToken or 0) + 1
+    local loopToken = state.loopToken
+
+    task.spawn(function()
+        while state.loopToken == loopToken do
+            local didWork = false
+            for weapon in pairs(state.pendingApplies) do
+                didWork = true
+                state.pendingApplies[weapon] = nil
+                pcall(function()
+                    state.applyToWeapon(weapon)
+                end)
+            end
+            task.wait(didWork and 0.05 or 0.25)
+        end
+    end)
+
+    task.spawn(function()
+        while state.loopToken == loopToken do
+            pcall(function()
+                local item = currentEquippedItem()
+                local weapon = getWeaponName(item)
+                if weapon and needsCurrentApply(item) then
+                    state.applyToWeapon(weapon)
+                end
+            end)
+            task.wait(0.2)
+        end
+    end)
+end
+
+local function patchRemote()
+    if state.remoteHookVersion == "equip-local-gated-v1" or type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" or type(newcclosure) ~= "function" then
+        return
+    end
+
+    local remote = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Data"):WaitForChild("EquipCosmetic")
+    local oldNamecall
+    oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+        local method = getnamecallmethod()
+        if state.enabled ~= false and self == remote and method == "FireServer" then
+            local weapon, cosmeticType, cosmeticName, options = ...
+            if type(weapon) == "string" and COSMETIC_TYPES[cosmeticType] then
+                state.commitLocalCosmetic(weapon, cosmeticType, cosmeticName, options)
+                return nil
+            end
+        end
+        return oldNamecall(self, ...)
+    end))
+
+    state.namecallHooked = true
+    state.remoteHookVersion = "equip-local-gated-v1"
+end
+
+function state.uninstall()
+    state.enabled = false
+    state.loopToken = (state.loopToken or 0) + 1
+    state.pendingApplies = {}
+    state._weapon_inventory_replicate_queued = nil
+
+    local originals = state.originals or {}
+
+    if type(originals.cosmeticOwnership) == "table" then
+        for name, original in pairs(originals.cosmeticOwnership) do
+            if type(original) == "function" then
+                CosmeticLibrary[name] = original
+            end
+        end
+    end
+
+    if originals.getViewModelImage then
+        ItemLibrary.GetViewModelImage = originals.getViewModelImage
+    end
+    if originals.getViewModelImageFromWeaponData then
+        ItemLibrary.GetViewModelImageFromWeaponData = originals.getViewModelImageFromWeaponData
+    end
+    if originals.getWeaponData then
+        PlayerDataController.GetWeaponData = originals.getWeaponData
+    end
+    if originals.weaponSlotSetup then
+        WeaponSlot._Setup = originals.weaponSlotSetup
+    end
+    if originals.clientViewModelNew then
+        ClientViewModel.new = originals.clientViewModelNew
+    end
+    if originals.staticViewModelNew then
+        StaticViewModel.new = originals.staticViewModelNew
+    end
+
+    if originals.fmGetOverride then
+        FloatingModelClass._GetSelectedCosmeticOverride = originals.fmGetOverride
+    end
+    if originals.fmGetName then
+        FloatingModelClass._GetViewModelName = originals.fmGetName
+    end
+    if originals.fmUpdate then
+        FloatingModelClass._UpdateViewModel = originals.fmUpdate
+    end
+    if originals.fmGenerate then
+        FloatingModelClass._Generate = originals.fmGenerate
+    end
+
+    local floatingModel = Equipment.FloatingModel
+    if floatingModel then
+        if originals.liveFloatingGenerate then
+            floatingModel._Generate = originals.liveFloatingGenerate
+        end
+        if originals.liveFloatingGetName then
+            floatingModel._GetViewModelName = originals.liveFloatingGetName
+        end
+        if originals.liveFloatingUpdate then
+            floatingModel._UpdateViewModel = originals.liveFloatingUpdate
+        end
+        if originals.liveFloatingOverride then
+            floatingModel._GetSelectedCosmeticOverride = originals.liveFloatingOverride
+        end
+    end
+
+    local equipmentState = Equipment.EquipmentState
+    if equipmentState then
+        if originals.liveSelectCosmetic then
+            equipmentState.SelectCosmetic = originals.liveSelectCosmetic
+        end
+        if originals.liveSetInverted then
+            equipmentState.SetCosmeticInvertedState = originals.liveSetInverted
+        end
+        if originals.liveStartCustomizing then
+            equipmentState.StartCustomizing = originals.liveStartCustomizing
+        end
+    end
+    if originals.equipmentSelectCosmetic then
+        Equipment.SelectCosmetic = originals.equipmentSelectCosmetic
+    end
+    if originals.equipmentStartCustomizing then
+        Equipment.StartCustomizing = originals.equipmentStartCustomizing
+    end
+
+    state.playerDataPatchVersion = nil
+    state.clientViewModelPatchVersion = nil
+    state.weaponSlotPatchVersion = nil
+    state.staticViewModelPatchVersion = nil
+    state.liveFloatingPatchVersion = nil
+    state.equipmentStatePatchVersion = nil
+    state.enabled = false
+    return true
+end
+
+state.disable = state.uninstall
+
+local function loadAllCosmeticsIntoInventory()
+    local data = getData()
+    if not data then
+        return
+    end
+
+    data.CosmeticInventory = data.CosmeticInventory or {}
+    data.WeaponInventory = data.WeaponInventory or {}
+
+    local yieldIfNeeded = makeBudgetYielder()
+    for cosmeticName, cosmeticInfo in pairs(CosmeticLibrary.Cosmetics or {}) do
+        if type(cosmeticName) == "string" and type(cosmeticInfo) == "table" then
+            data.CosmeticInventory[cosmeticName] = data.CosmeticInventory[cosmeticName] or true
+        end
+        yieldIfNeeded()
+    end
+
+    for itemName, itemInfo in pairs(ItemLibrary.Items or {}) do
+        local weaponName
+        if type(itemName) == "string" then
+            weaponName = itemName
+        end
+        if type(itemInfo) == "table" then
+            weaponName = itemInfo.Name or itemInfo.ItemName or weaponName
+        end
+
+        if type(weaponName) == "string" and not CosmeticLibrary.Cosmetics[weaponName] then
+            ensureWeaponData(weaponName)
+        end
+        yieldIfNeeded()
+    end
+end
+
+local function syncInitialSelection()
+    loadAllCosmeticsIntoInventory()
+
+    local weapon = selectedWeapon() or "Assault Rifle"
+    local data = getData()
+    local weaponData = data and data.WeaponInventory and data.WeaponInventory[weapon]
+
+    if weaponData then
+        state.localEquips[weapon] = state.localEquips[weapon] or {}
+        state.localEquips[weapon].Skin = cloneCosmetic(weaponData.Skin) or state.localEquips[weapon].Skin
+        state.localEquips[weapon].Wrap = cloneCosmetic(weaponData.Wrap) or state.localEquips[weapon].Wrap
+        state.localEquips[weapon].Charm = cloneCosmetic(weaponData.Charm) or state.localEquips[weapon].Charm
+    end
+
+    if weapon == "Assault Rifle" then
+        state.commitLocalCosmetic("Assault Rifle", "Skin", state.localEquips["Assault Rifle"] and state.localEquips["Assault Rifle"].Skin and state.localEquips["Assault Rifle"].Skin.Name or "AKEY-47", {})
+        state.commitLocalCosmetic("Assault Rifle", "Wrap", state.localEquips["Assault Rifle"] and state.localEquips["Assault Rifle"].Wrap and state.localEquips["Assault Rifle"].Wrap.Name or "Chromatic", state.localEquips["Assault Rifle"] and state.localEquips["Assault Rifle"].Wrap or {})
+        state.commitLocalCosmetic("Assault Rifle", "Charm", state.localEquips["Assault Rifle"] and state.localEquips["Assault Rifle"].Charm and state.localEquips["Assault Rifle"].Charm.Name or "10 Gallon Hat", {})
+    end
+
+    for weaponName in pairs(state.localEquips) do
+        if refreshWeaponIcons then
+            refreshWeaponIcons(weaponName)
+        end
+        refreshMenu(weaponName == weapon)
+    end
+end
+
+patchOwnership()
+patchItemLibraryImages()
+patchPlayerDataController()
+patchWeaponSlot()
+patchClientViewModel()
+patchStaticViewModel()
+patchFloatingModelClass()
+patchFloatingModelInstance()
+patchEquipmentState()
+patchRemote()
+installLoops()
+syncInitialSelection()
+refreshMenu(true)
+
+print("[RIVALS cosmetics] installed", state.version)
